@@ -59,7 +59,7 @@ def require_jwt(function):
 
 @APP.route('/', methods=['POST', 'GET'])
 def health():
-    return jsonify("Healthy")
+    return jsonify({"message": "Healthy"})
 
 
 @APP.route('/auth', methods=['POST'])
@@ -68,6 +68,8 @@ def auth():
     Create JWT token based on email.
     """
     request_data = request.get_json()
+    if request_data is None:
+        return jsonify({"message": "Bad request"}, 400)
     email = request_data.get('email')
     password = request_data.get('password')
     if not email:
