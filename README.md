@@ -24,8 +24,25 @@ You will also need an AWS account (??? both console and programmatic access)
 ### Install dependencies
 
 ```
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
+
+### Before running the application
+
+Create the file `.env_file` and make sure you are adding it to `.gitignore`. You definitely **don't want** to commit your secrets to GiHub.
+
+```
+JWT_SECRET='MyJWTTTT'
+LOG_LEVEL=DEBUG
+```
+
+If you don't set these environment variables, the app will default to what we define as base case in `main.py` 
+
+```py
+JWT_SECRET = os.environ.get('JWT_SECRET', 'abc123abc1234')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+```
+---
 
 ### Run Flask App
 
@@ -86,7 +103,7 @@ curl http://127.0.0.1:8080/auth -X POST -H "Content-Type: application/json" -d '
 ```
 
 #### GET /contents
-* Returns an object with email, exp and nbf with their proper values
+* Returns the decrypted content of the JWT including email, exp and nbf with their proper values
 * Requires a valid JWT token
 
 *Note:* The lifespan of the token starts after the time stated in the nbf claim and ends at the time stated in the exp claim.
@@ -107,6 +124,52 @@ curl http://127.0.0.1:8080/contents -H "Authorization: Bearer eyJ0eXAiOiJKV1QiLC
 }
 ```
 
+## Docker locally
+
+### Build and tag
+
+```
+docker build -t dockerizedflaskapp .
+```
+
+### Run the container
+
+```
+docker run --name containerDockerizedflaskapp --env-file=.env_file -p 80:8080 dockerizedflaskapp
+```
+
+*Notes:*
+* We pass the file containing the environment variables
+* We expose the port 8080 of the container to the port 80 of the host machine
+
+
+### Check container
+
+```
+curl http://localhost:80/
+```
+
+Expected response:
+
+```
+{"message":"Healthy"}
+```
+
+#### Other useful commands
+
+As a clean up you can remove the `container` and the `image` as well.
+
+1. List containers: `docker container ls`
+1. Stop container: `docker container stop <container_id>`
+1. Remove container: `docker container rm <container_id>`
+1. List images: `docker image ls`
+1. Remove image: `docker image rm <image_id>`
+
+## Docker, Kubernetes and AWS Code Pipeline
+
+
+
+
 
 Check this
     - groups:
@@ -116,11 +179,3 @@ Check this
 
 and how to update
 
----
-
-Aclarar que tengo .env_file con los valores
-
-```
-JWT_SECRET='MyJWTTTT'
-LOG_LEVEL=DEBUG
-```
