@@ -167,15 +167,94 @@ As a clean up you can remove the `container` and the `image` as well.
 
 ## Docker, Kubernetes and AWS Code Pipeline
 
+### Create EKS cluster
+With default configuration.
 
+```
+eksctl create cluster --name simple-jwt-api --region=us-east-2
+```
 
+*Note:* In case of failures, try switching the `region`
 
+Wait until `AWS CloudFormation` finishes creating your stack.
+This operation can take `20mins` or more.
 
-Check this
+**Get the status of the nodes**
+
+```
+kubectl get nodes
+```
+
+### Clean up
+
+#### Delete EKS cluster
+
+```
+eksctl delete cluster simple-jwt-api  --region=us-east-2
+```
+
+#### Create IAM Role
+
+This is the IAM role that CodeBuild will assume to access EKS cluster (it is going to include the trust relationship and the proper policy)
+
+If you don't know your account id...
+
+```
+aws sts get-caller-identity --query Account --output text
+```
+
+Then, replace `<ACCOUNT_ID>` in `trust.json` with your account id.
+
+```
+aws iam create-role --role-name SimpleJwtApiCodeBuildKubectlRole --assume-role-policy-document file://trust.json --output text --query 'Role.Arn'
+```
+
+##### Create Policy
+
+We are going to create a new policy and attach it to the previous role.
+
+```
+aws iam put-role-policy --role-name SimpleJwtApiCodeBuildKubectlRole --policy-name eks-describe --policy-document file://iam-role-policy.json
+```
+
+#### Allow the role to access the cluster
+
+We are going to modify `aws-auth ConfigMap` (used to grant role-based access control to your cluster).
+Currently just us (or the user who created the cluster) has permissions to administer it.
+
+```bash
+# The file will be created at `/System/Volumes/Data/private/tmp/aws-auth-patch.yml` path
+kubectl get -n kube-system configmap/aws-auth -o yaml > /tmp/aws-auth-patch.yml
+
+vi /System/Volumes/Data/private/tmp/aws-auth-patch.yml
+```
+
+Under `mapRoles`, add a new groups block:
+
+```yml
+    - groups:
+      - system:masters
+      rolearn: arn:aws:iam::<ACCOUNT_ID>:role/SimpleJwtApiCodeBuildKubectlRole
+      username: build  
+```
+
+The result would look like...
+
+```yml
+  mapRoles: |
+    - groups:
+      - system:masters
+      rolearn: arn:aws:iam::<ACCOUNT_ID>:role/SimpleJwtApiCodeBuildKubectlRole
+      username: build  
     - groups:
       - system:bootstrappers
       - system:nodes
-      rolearn: arn:aws:iam::<ACCOUNT_ID>:role/eksctl-simple-jwt-api-nodegroup-n-NodeInstanceRole-17C402QC9VF6
+      rolearn: arn:aws:iam::<ACCOUNT_ID>:role/eksctl-simple-jwt-api-nodegroup-n-NodeInstanceRole-1OTCVKJBLMH9Q
+      username: system:node:{{EC2PrivateDNSName}}
+```
 
-and how to update
+Now we can update the cluster's configmap
 
+```
+kubectl patch configmap/aws-auth -n kube-system --patch "$(cat /tmp/aws-auth-patch.yml)"
+```
