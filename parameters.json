@@ -9,7 +9,7 @@
   },
   {
     "ParameterKey": "GitBranch",
-    "ParameterValue": "main"
+    "ParameterValue": "master"
   },
   {
     "ParameterKey": "GitHubUser",
@@ -17,7 +17,7 @@
   },
   {
     "ParameterKey": "KubectlRoleName",
-    "ParameterValue": "CBKubectlRole"
+    "ParameterValue": "SimpleJwtApiCodeBuildKubectlRole"
   },
   {
     "ParameterKey": "GitHubToken",
