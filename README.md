@@ -50,6 +50,12 @@ LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
 python main.py
 ```
 
+### Run Unit Tests
+
+```
+python -m pytest test_main.py
+```
+
 ### Endpoints
 
 Responses (including errors) are returned as JSON objects.
@@ -185,14 +191,6 @@ This operation can take `20mins` or more.
 kubectl get nodes
 ```
 
-### Clean up
-
-#### Delete EKS cluster
-
-```
-eksctl delete cluster simple-jwt-api  --region=us-east-2
-```
-
 #### Create IAM Role
 
 This is the IAM role that CodeBuild will assume to access EKS cluster (it is going to include the trust relationship and the proper policy)
@@ -257,4 +255,92 @@ Now we can update the cluster's configmap
 
 ```
 kubectl patch configmap/aws-auth -n kube-system --patch "$(cat /tmp/aws-auth-patch.yml)"
+```
+
+### Create pipeline stack
+
+First, update `parameters.json` with your data.
+
+**IMPORTANT**: Be sure you are not committing `parameters.json` to your repo (include it to your `.gitignore`). I'm doing it here as an example, but with placeholders.
+
+You will need to update at least your GH username and add a personal access token. You can generate one here: https://github.com/settings/tokens. For scope select `repo`.
+If you are using other name for your cluster and/or role, update that also in your `parameters.json`
+
+```
+aws cloudformation create-stack  \
+ --stack-name ci-cd-codepipeline \
+ --region us-east-2 \
+ --template-body file://ci-cd-codepipeline.cfn.yml \
+ --parameters file://parameters.json \
+ --capabilities "CAPABILITY_IAM"
+```
+
+This will also create a `CodeBuild` project based on `buildspec.yml`
+
+*Note:* We should try to use the same version of `kubectl` locally (when we are creating the cluster) and in `buildspec.yml`.
+
+
+### Add JWT_SECRET to AWS Parameter Store
+
+```
+aws ssm put-parameter --name JWT_SECRET --overwrite --value "MyJWTTTT" --type SecureString --region us-east-2
+```
+
+*This secret will be set during build (by CodeBuild) as an environment variable.*
+
+### Testing
+
+Now, every time you make a change in your repository (example, when you merge a PR) `CodePipeline` will execute both stages, first fetching from source (in our case GH) and then building and deploying the artifact to the EKS cluster. 
+
+#### Get the external Ip
+
+```
+kubectl get services simple-jwt-api -o wide
+```
+
+#### Get a TOKEN
+
+We are getting a TOKEN and setting it as an environment variable
+
+```
+export TOKEN=`curl -d '{"email":"email@email","password":"password"}' -H "Content-Type: application/json" -X POST abec308a46cde4b158fbda16e02f7451-1708554601.us-east-2.elb.amazonaws.com/auth  | jq -r '.token'`
+```
+
+### Make request with a VALID TOKEN
+
+```
+curl --request GET 'abec308a46cde4b158fbda16e02f7451-1708554601.us-east-2.elb.amazonaws.com/contents' -H "Authorization: Bearer ${TOKEN}" | jq 
+```
+
+**Sample result**
+
+```
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100    58  100    58    0     0    325      0 --:--:-- --:--:-- --:--:--   325
+{
+  "email": "email@email",
+  "exp": 1624309579,
+  "nbf": 1623099979
+}
+```
+
+### Clean up
+
+#### Delete Code Pipeline Stack
+
+```
+aws cloudformation delete-stack --stack-name ci-cd-codepipeline --region=us-east-2
+```
+
+#### Delete secret from Parameter Store
+
+```
+aws ssm delete-parameter --name JWT_SECRET --region us-east-2
+```
+
+#### Delete EKS cluster
+
+```
+eksctl delete cluster simple-jwt-api --region=us-east-2
 ```
