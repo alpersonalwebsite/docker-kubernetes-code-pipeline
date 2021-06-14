@@ -1,7 +1,5 @@
 # Docker, Kubernetes and Code Pipeline
 
-Under development...
-
 ## Overview
 
 This is an easy, basic and raw example of **HOW to** containerize and deploy a a flask app to `Kubernetes` using `EKS`.
