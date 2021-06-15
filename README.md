@@ -2,9 +2,9 @@
 
 ## Overview
 
-This is an easy, basic and raw example of **HOW to** containerize and deploy a a flask app to `Kubernetes` using `EKS`.
+This is an easy, basic and raw example of **HOW to** containerize and deploy a flask app to `Kubernetes` using `EKS`.
 
-Every change in your repository (??? is this right or just some changes) will trigger a new build in Code Build which will result in a new docker image deployed as a container in our EKS cluster. 
+Every change in your repository will trigger a new build (in Code Build) which will result in a new docker image deployed as a container in our EKS cluster. 
 
 ## Requirements
 
@@ -14,8 +14,7 @@ Every change in your repository (??? is this right or just some changes) will tr
 * eksctl
 * kubectl
 * Works on Linux, Windows, macOS, BSD
-
-You will also need an AWS account (??? both console and programmatic access)
+* An AWS account
 
 ## Local development
 
