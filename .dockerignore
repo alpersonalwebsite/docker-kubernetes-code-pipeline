@@ -2,11 +2,11 @@
 #
 # That mattered because the README tells the reader to create `.env_file` holding
 # JWT_SECRET, and then to `docker build` in the same directory. .gitignore keeps that file
-# out of git; nothing kept it out of the image. Measured by building and inspecting:
-#
-#   /app/.env_file:
-#   JWT_SECRET='MyJWTTTT'
-#   .git present: 28 files
+# out of git; nothing kept it out of the image. Measured by building the image and looking
+# inside it: /app/.env_file was present, complete with its JWT_SECRET assignment, and
+# /app/.git carried 28 files of history. The value itself is not repeated here, because
+# writing it into a tracked file re-commits the thing the finding is about and leaves every
+# secret scanner flagging this path forever.
 #
 # buildspec.yml pushes that image to ECR, so the secret travelled to a registry and sat in
 # a layer readable by anyone who could pull it. Deleting the file in a later layer would

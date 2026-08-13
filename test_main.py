@@ -264,6 +264,89 @@ def test_hash_comparison_is_constant_time():
     assert not re.search(r'return\s+candidate\s*==\s*expected', source)
 
 
+@pytest.mark.parametrize('email,password', [
+    (['a@b.c'], 'pw'),
+    ({'a': 'b@c.d'}, 'pw'),
+    (1234, 'pw'),
+    (EMAIL, 1234),
+    (EMAIL, ['pw']),
+    (EMAIL, {'p': 'w'}),
+])
+def test_auth_rejects_non_string_credentials(client, email, password):
+    """
+    Review finding. A truthy non-string passed the emptiness check and blew up downstream:
+    a list or object email raised TypeError: unhashable type on the users lookup, and a
+    non-string password raised AttributeError on .encode. Measured: all four answered 500.
+    """
+    response = client.post('/auth', data=json.dumps({'email': email, 'password': password}),
+                           content_type='application/json')
+    assert response.status_code == 400
+    assert response.json['error'] == 400
+
+
+@pytest.mark.parametrize('stored,label', [
+    ('pbkdf2_sha256$0$%s$%s', 'zero iterations'),
+    ('pbkdf2_sha256$-1$%s$%s', 'negative iterations'),
+    ('pbkdf2_sha256$99999999999$%s$%s', 'absurd iteration count'),
+])
+def test_auth_rejects_malformed_stored_iterations(client, stored, label):
+    """
+    Review finding. pbkdf2_hmac raises ValueError('iteration value must be greater than 0.')
+    and that call sat below the parsing try/except, so a stored count of 0 or -1 answered
+    HTTP 500. Measured before the fix. An absurd count is the other direction: it would
+    occupy the worker rather than failing, so it is rejected without being run.
+    """
+    salt = base64.b64encode(b'x' * 16).decode()
+    digest = base64.b64encode(b'y' * 32).decode()
+    os.environ['AUTH_USERS'] = json.dumps({EMAIL: stored % (salt, digest)})
+    try:
+        response = client.post('/auth',
+                               data=json.dumps({'email': EMAIL, 'password': PASSWORD}),
+                               content_type='application/json')
+        assert response.status_code == 401, label
+    finally:
+        os.environ['AUTH_USERS'] = json.dumps(
+            {EMAIL: hash_password.hash_password(PASSWORD)})
+
+
+@pytest.mark.parametrize('salt_len,digest_len', [(8, 32), (15, 32), (16, 16), (16, 31)])
+def test_wrong_sized_salt_or_digest_is_reported_as_malformed(client, caplog, salt_len,
+                                                             digest_len):
+    """
+    Asserts on the LOG, not the status, and that distinction is the point.
+
+    A digest of the wrong length already fails hmac.compare_digest, so the response is 401
+    with or without these checks: poisoning the digest-length check out left all tests
+    passing when this asserted only the status code. What the checks change is whether the
+    operator learns AUTH_USERS is broken or reads it as a wrong password. That is the
+    observable behaviour, so that is what is tested.
+    """
+    stored = 'pbkdf2_sha256$260000$%s$%s' % (
+        base64.b64encode(b'x' * salt_len).decode(),
+        base64.b64encode(b'y' * digest_len).decode())
+    os.environ['AUTH_USERS'] = json.dumps({EMAIL: stored})
+    try:
+        with caplog.at_level(logging.ERROR, logger=main.__name__):
+            response = client.post('/auth',
+                                   data=json.dumps({'email': EMAIL, 'password': PASSWORD}),
+                                   content_type='application/json')
+        assert response.status_code == 401
+        assert any('malformed' in r.message for r in caplog.records), \
+            'a bad stored hash must be reported as malformed, not read as a wrong password'
+    finally:
+        os.environ['AUTH_USERS'] = json.dumps(
+            {EMAIL: hash_password.hash_password(PASSWORD)})
+
+
+def test_hash_password_output_satisfies_the_validator():
+    """The generator and the parser must agree on sizes, or valid logins would 401."""
+    stored = hash_password.hash_password(PASSWORD)
+    _, iterations, salt, digest = stored.split('$')
+    assert 1 <= int(iterations) <= main.MAX_PBKDF2_ITERATIONS
+    assert len(base64.b64decode(salt)) >= main.SALT_MIN_BYTES
+    assert len(base64.b64decode(digest)) == main.DIGEST_BYTES
+
+
 def test_password_hashing_round_trips():
     stored = hash_password.hash_password(PASSWORD)
     algorithm, iterations, salt, digest = stored.split('$')

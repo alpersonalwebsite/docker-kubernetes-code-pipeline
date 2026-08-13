@@ -188,11 +188,23 @@ Resources:
           import boto3
 
 
+          # Response timeout. urlopen with no timeout uses the global default socket
+          # timeout, which is None, so a stalled pre-signed endpoint blocks until the Lambda
+          # itself is killed at 300s. The function then dies without signalling and the stack
+          # waits on the custom resource for an hour. 30s leaves room to still report.
+          RESPONSE_TIMEOUT_SECONDS = 30
+
+
           def send(event, context, status, message):
             body = json.dumps({
               'Status': status,
               'Reason': message + ' See details in CloudWatch Log Stream: ' + context.log_stream_name,
-              'PhysicalResourceId': context.log_stream_name,
+              # ECHO the id CloudFormation sent, and only fall back on Create where there is
+              # none. Returning a NEW PhysicalResourceId on Update means CloudFormation
+              # treats the resource as replaced and sends a Delete for the old one, so using
+              # context.log_stream_name unconditionally made every update look like a
+              # replacement, because that value differs on every invocation.
+              'PhysicalResourceId': event.get('PhysicalResourceId') or context.log_stream_name,
               'StackId': event['StackId'],
               'RequestId': event['RequestId'],
               'LogicalResourceId': event['LogicalResourceId'],
@@ -201,7 +213,7 @@ Resources:
             request = urllib.request.Request(
               event['ResponseURL'], data=body, method='PUT',
               headers={'content-type': '', 'content-length': str(len(body))})
-            urllib.request.urlopen(request)
+            urllib.request.urlopen(request, timeout=RESPONSE_TIMEOUT_SECONDS)
 
 
           def handler(event, context):
@@ -215,26 +227,42 @@ Resources:
 
                 assume = client.get_role(RoleName=kubectl_role_name)
                 assume_doc = assume['Role']['AssumeRolePolicyDocument']
-                roles = [{'Effect': 'Allow',
-                          'Principal': {'AWS': build_role_arn},
-                          'Action': 'sts:AssumeRole'}]
+                statements = assume_doc.get('Statement') or []
+                if isinstance(statements, dict):
+                  statements = [statements]
 
-                for statement in assume_doc['Statement']:
-                  principal = statement.get('Principal', {})
-                  if isinstance(principal, dict) and 'AWS' in principal:
-                    existing = principal['AWS']
-                    # Was `statement['Principal']['AWS'].startswith(...)`, which raises
-                    # AttributeError when the value is a LIST of ARNs, and IAM returns a
-                    # list as soon as a second principal is added.
-                    if isinstance(existing, str):
-                      existing = [existing]
-                    if any(str(a).startswith('arn:aws:iam:') for a in existing):
-                      roles.append(statement)
+                # ADD to the trust policy; never rebuild it. The previous version kept only
+                # statements whose Principal was a dict containing AWS with a value starting
+                # 'arn:aws:iam:', and DISCARDED everything else, so it silently deleted:
+                #   Principal: {Service: ...}     an EC2 or EKS service trust
+                #   Principal: {Federated: ...}   an OIDC provider, e.g. IRSA
+                #   arn:aws-us-gov: / arn:aws-cn:  every non-commercial partition
+                # Since it wrote the filtered list back, any of those trusts on the role
+                # would be gone after stack creation. Keeping the list and appending has no
+                # such failure mode, and skipping the append when the ARN is already there
+                # keeps it idempotent across repeated Creates.
+                already = False
+                for statement in statements:
+                  principal = statement.get('Principal')
+                  if not isinstance(principal, dict):
+                    continue
+                  aws = principal.get('AWS')
+                  if aws is None:
+                    continue
+                  if isinstance(aws, str):
+                    aws = [aws]
+                  if build_role_arn in [str(a) for a in aws]:
+                    already = True
+                    break
 
-                assume_doc['Statement'] = roles
-                client.update_assume_role_policy(
-                  RoleName=kubectl_role_name,
-                  PolicyDocument=json.dumps(assume_doc))
+                if not already:
+                  statements.append({'Effect': 'Allow',
+                                     'Principal': {'AWS': build_role_arn},
+                                     'Action': 'sts:AssumeRole'})
+                  assume_doc['Statement'] = statements
+                  client.update_assume_role_policy(
+                    RoleName=kubectl_role_name,
+                    PolicyDocument=json.dumps(assume_doc))
 
               send(event, context, 'SUCCESS', 'Resource creation successful!')
             except Exception as exc:  # noqa: BLE001 - must report, never propagate
@@ -318,13 +346,25 @@ Resources:
                 Effect: Allow
                 Action:
                   - iam:PassRole
+              # Split by resource level, because s3:GetBucketVersioning was granted on the
+              # OBJECT arn and therefore could never match. Checked against the AWS service
+              # authorization data: GetBucketVersioning, GetBucketAcl and GetBucketLocation
+              # accept only arn:aws:s3:::<bucket>, while the object actions accept only
+              # arn:aws:s3:::<bucket>/<key>. CodePipeline needs the bucket three because it
+              # verifies the artifact store is versioned before using it, so on the old
+              # policy that check had no permission behind it.
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
               - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
                 Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:GetObject
                   - s3:GetObjectVersion
-                  - s3:GetBucketVersioning
 
   CodeBuildServiceRole:
     Type: AWS::IAM::Role

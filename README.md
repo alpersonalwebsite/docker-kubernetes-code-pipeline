@@ -35,11 +35,15 @@ generates the entry, prompting for the password so it never reaches your shell h
 python hash_password.py user@example.com
 ```
 
-It prints a line ready to paste:
+It prints a line ready to paste, of this shape:
 
 ```
-AUTH_USERS='{"user@example.com": "pbkdf2_sha256$260000$c2FsdHNhbHQ=$aGFzaGhhc2g="}'
+AUTH_USERS='{"user@example.com": "pbkdf2_sha256$<iterations>$<salt>$<digest>"}'
 ```
+
+Paste the complete line it prints. The parts are not illustrative: `main.py` requires a salt
+of at least 16 bytes and a digest of exactly 32, so a hand-written stand-in is rejected as
+malformed and every login fails with 401.
 
 ### Before running the application
 
@@ -52,7 +56,7 @@ the `$` separators in the hash:
 ```shell
 export JWT_SECRET=MyJWTTTT
 export LOG_LEVEL=DEBUG
-export AUTH_USERS='{"user@example.com": "pbkdf2_sha256$260000$c2FsdHNhbHQ=$aGFzaGhhc2g="}'
+export AUTH_USERS='<the line hash_password.py printed, value and all>'
 ```
 
 For `docker run`, put the same values in `.env_file`, which is gitignored. **No quotes in
@@ -63,7 +67,7 @@ then saw `"'MyJWTTTT'"`.
 ```
 JWT_SECRET=MyJWTTTT
 LOG_LEVEL=DEBUG
-AUTH_USERS={"user@example.com": "pbkdf2_sha256$260000$c2FsdHNhbHQ=$aGFzaGhhc2g="}
+AUTH_USERS={"user@example.com": "pbkdf2_sha256$<iterations>$<salt>$<digest>"}
 ```
 
 > `.env_file` is read by `docker run --env-file` and by nothing else. It is not loaded by
@@ -335,7 +339,7 @@ Kubernetes Secret.
 
 ```
 aws ssm put-parameter --name JWT_SECRET --overwrite --value "MyJWTTTT" --type SecureString --region us-east-2
-aws ssm put-parameter --name AUTH_USERS --overwrite --value '{"user@example.com": "pbkdf2_sha256$260000$..."}' --type SecureString --region us-east-2
+aws ssm put-parameter --name AUTH_USERS --overwrite --value '{"user@example.com": "pbkdf2_sha256$<iterations>$<salt>$<digest>"}' --type SecureString --region us-east-2
 ```
 
 Use the `AUTH_USERS` value that `hash_password.py` printed. Nothing here stores a plaintext

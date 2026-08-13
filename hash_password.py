@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-# Kept in step with main.py's PBKDF2_ITERATIONS.
+# Kept in step with main.py's PBKDF2_ITERATIONS and SALT_MIN_BYTES.
 ITERATIONS = 260000
 SALT_BYTES = 16
 

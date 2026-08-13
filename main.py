@@ -51,6 +51,15 @@ JWT_SECRET = _load_secret()
 # period-appropriate figure rather than a number picked here.
 PBKDF2_ITERATIONS = 260000
 
+# Upper bound accepted from a STORED hash. A stored count is operator-supplied, and an
+# absurd one would occupy the worker for as long as it takes rather than failing, so it is
+# rejected instead of run. Ten times the current cost leaves room to raise the real figure.
+MAX_PBKDF2_ITERATIONS = PBKDF2_ITERATIONS * 10
+
+# What hash_password.py produces, and what a stored hash must therefore look like.
+SALT_MIN_BYTES = 16
+DIGEST_BYTES = 32
+
 
 def _load_users():
     '''
@@ -92,6 +101,27 @@ def _check_password(email, password):
         salt = base64.b64decode(salt_b64, validate=True)
         expected = base64.b64decode(expected_b64, validate=True)
         rounds = int(iterations)
+        # Validated INSIDE the try, so a malformed stored hash is a 401 rather than a 500.
+        # All three measured against pbkdf2_hmac, because the guarantees differ:
+        #   rounds <= 0            ValueError('iteration value must be greater than 0.')
+        #   rounds ~1e11           OverflowError('iteration value is too great.')
+        # Both of those calls sit BELOW this block, so `$0$` or `$-1$` in AUTH_USERS
+        # answered HTTP 500 before this guard existed. A large-but-representable count
+        # (say 5e8) raises nothing at all and simply occupies the worker, which is the
+        # reason for an upper bound rather than just a positive check.
+        #
+        # The salt and digest sizes are different in kind and worth being honest about:
+        # they change no status code, because a digest of the wrong length already fails
+        # hmac.compare_digest and answers 401. What they change is the LOG, turning a
+        # silent 401 into "Stored hash for a user is malformed", which is the difference
+        # between an operator seeing a broken AUTH_USERS and assuming a wrong password.
+        if not 1 <= rounds <= MAX_PBKDF2_ITERATIONS:
+            raise ValueError('iteration count out of range: %d' % rounds)
+        if len(salt) < SALT_MIN_BYTES:
+            raise ValueError('salt shorter than %d bytes' % SALT_MIN_BYTES)
+        if len(expected) != DIGEST_BYTES:
+            raise ValueError('digest is not %d bytes, so it is not a sha256 digest'
+                             % DIGEST_BYTES)
     except (ValueError, binascii.Error):
         logging.getLogger(__name__).error("Stored hash for a user is malformed")
         return False
@@ -225,11 +255,15 @@ def auth():
         return _error(400, "Bad request")
     email = request_data.get('email')
     password = request_data.get('password')
-    if not email:
-        LOG.error("No email provided")
+    # isinstance, not just truthiness. A truthy non-string reached _check_password and blew
+    # up there: measured, a list or object email raised TypeError: unhashable type on the
+    # dictionary lookup, and a non-string password raised AttributeError on .encode. All
+    # four answered HTTP 500. The README documents both as strings, so this is a 400.
+    if not email or not isinstance(email, str):
+        LOG.error("No valid email provided")
         return _error(400, "Missing parameter: email")
-    if not password:
-        LOG.error("No password provided")
+    if not password or not isinstance(password, str):
+        LOG.error("No valid password provided")
         return _error(400, "Missing parameter: password")
 
     if not _check_password(email, password):
