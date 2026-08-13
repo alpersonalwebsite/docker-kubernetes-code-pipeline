@@ -16,6 +16,7 @@ import datetime
 import importlib
 import inspect
 import json
+import logging
 import os
 import re
 
@@ -69,6 +70,51 @@ def test_fixture_actually_sets_the_secret(client):
     '''The fixture used to be a no-op. This fails if that regresses.'''
     assert main.JWT_SECRET == SECRET
     assert main.JWT_SECRET != OLD_PUBLISHED_DEFAULT
+
+
+def test_unset_secret_generates_a_random_key_rather_than_the_old_default(caplog):
+    '''
+    Covers the fallback branch of _load_secret, which no other test can reach.
+
+    The client fixture always sets JWT_SECRET before reloading, so _load_secret always took
+    the from_env branch and the generated-key path never executed. Replacing
+    secrets.token_urlsafe(32) with the old published literal therefore left the whole suite
+    passing, which made the fixture-based tests useless as a guard on exactly the branch
+    where a regression to a published key would be silent. That branch is also what the
+    function's docstring relies on when it claims published-key forgery is impossible, so
+    the claim needed a test of its own.
+
+    Deliberately does not use the client fixture, and restores the environment and the
+    module afterwards so test order cannot matter.
+    '''
+    saved_secret = os.environ.pop('JWT_SECRET', None)
+    saved_level = os.environ.get('LOG_LEVEL')
+    # This module sets LOG_LEVEL=ERROR to keep the suite quiet, and main's _logger() applies
+    # it to the same logger _load_secret warns on. On a reload that level is already in place,
+    # so the warning was filtered before caplog could see it and this test failed against
+    # correct code. Raising the level for the duration is what makes the assertion meaningful.
+    os.environ['LOG_LEVEL'] = 'WARNING'
+    caplog.set_level(logging.WARNING, logger=main.__name__)
+    try:
+        importlib.reload(main)
+        first = main.JWT_SECRET
+        importlib.reload(main)
+        second = main.JWT_SECRET
+
+        assert first != OLD_PUBLISHED_DEFAULT
+        assert second != OLD_PUBLISHED_DEFAULT
+        # Any fixed fallback, published or not, makes these equal. A per-process key does not.
+        assert first != second
+        assert len(first) >= 32
+        # The fallback has to be loud, or an unset variable in production looks like success.
+        assert any('JWT_SECRET is not set' in r.message for r in caplog.records)
+    finally:
+        os.environ['JWT_SECRET'] = SECRET if saved_secret is None else saved_secret
+        if saved_level is None:
+            os.environ.pop('LOG_LEVEL', None)
+        else:
+            os.environ['LOG_LEVEL'] = saved_level
+        importlib.reload(main)
 
 
 def test_health(client):
