@@ -146,9 +146,15 @@ curl http://127.0.0.1:8080/auth -X POST -H "Content-Type: application/json" -d '
 
 ```json
 {
-  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE2MjQ0Njk3OTEsIm5iZiI6MTYyMzI2MDE5MSwiZW1haWwiOiJlbWFpbEBlbWFpbC5jb20ifQ.L1FHrGkceqamGyyQeTJ2rjL8B_4xBcc73ESswFWiIus"
+  "token": "<header>.<payload>.<signature>"
 }
 ```
+
+The real value is three base64url segments separated by dots. It is shown elided here on
+purpose: the original README pasted a complete token from a live run, and although that one
+expired in June 2021, a credential-shaped string in a public repository trips every secret
+scanner that looks at it, forever, for no teaching value. The decoded claims are what matter
+and they are shown under `/contents` below.
 
 ### GET /contents
 
