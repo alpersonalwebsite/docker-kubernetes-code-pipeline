@@ -80,6 +80,18 @@ spec:
           ports:
             - containerPort: 8080
               protocol: TCP
+          # One limitation of reading the secret this way, measured on k3s v1.31.5 rather
+          # than assumed: env.valueFrom injects the value when the container STARTS, so
+          # updating the Secret does not reach running pods. After rotating it, the Secret
+          # read `rotated-under-rbac` while the pod still reported the previous value, and
+          # only a change to the pod template brought the new one in.
+          #
+          # The pipeline is fine, because buildspec.yml builds a new image tag on every
+          # commit and that changes the template, which restarts the pods. Rotating the
+          # Parameter Store value WITHOUT a new build does not propagate: run
+          # `kubectl rollout restart deployment/simple-jwt-api` after such a rotation.
+          # Mounting the Secret as a volume would update in place, but the app reads its
+          # configuration from the environment, so that would be a larger change.
           env:
             - name: JWT_SECRET
               valueFrom:
