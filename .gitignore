@@ -32,3 +32,24 @@ htmlcov/
 .direnv
 
 .github/**
+
+# The real stack parameters, which hold a GitHub personal access token with repo scope.
+# parameters.example.json is the tracked template; copy it to parameters.json and fill that
+# in. The README used to tell the reader to put a real token in a file that was itself
+# tracked, and to remember not to commit it. Making the ignored filename the one the
+# instructions use means forgetting is no longer enough to leak a token.
+parameters.json
+
+# Never commit credentials, keys or private material. Kept in step with the list the
+# pre-commit secret scan enforces.
+*.log
+secrets/
+credentials*
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+node_modules/
+*.sqlite
+*.db
