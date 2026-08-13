@@ -1,30 +1,64 @@
 ---
 version: 0.2
 
+env:
+  variables:
+    # Pinned, because the old line resolved `stable.txt` at build time and installed
+    # whatever kubectl was newest. kubectl supports one minor version of skew either side
+    # of the cluster, so an unpinned client drifts out of support without this file
+    # changing, and the failure arrives on an unrelated commit. Keep this within one minor
+    # of the EKS control plane and bump it deliberately when the cluster is upgraded.
+    KUBECTL_VERSION: v1.31.5
+  parameter-store:
+    # Both are SecureString parameters. JWT_SECRET signs the tokens; AUTH_USERS holds the
+    # email-to-password-hash map that main.py verifies against. Neither is ever echoed:
+    # CodeBuild masks parameter-store values in the log, and the commands below pipe them
+    # rather than interpolating them into an echo.
+    JWT_SECRET: JWT_SECRET
+    AUTH_USERS: AUTH_USERS
 
 phases:
   install:
     runtime-versions:
+      # Left at 3.7 deliberately. It is end of life, but this is the build container rather
+      # than anything deployed, the pinned pytest 6.2.2 cannot run on 3.10+, and the
+      # available runtimes depend on the CodeBuild image, which cannot be checked from here.
+      # Changing it risks breaking a pipeline that is not testable outside AWS.
       python: 3.7
     commands:
       - echo 'about to call dockerd'
       - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2&
       - timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
-      - curl -sS -o aws-iam-authenticator https://amazon-eks.s3-us-west-2.amazonaws.com/1.10.3/2018-07-26/bin/linux/amd64/aws-iam-authenticator
-      # Get latest stable release kubectl
-      - curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
-        # Command for specific kubectl version:
-        #- curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.18.0/bin/linux/amd64/kubectl
-      - chmod +x ./kubectl ./aws-iam-authenticator
-      - echo `kubectl version`
+      # kubectl from dl.k8s.io, the official redirector, with its published SHA-256
+      # verified before the binary is made executable. The previous version piped an
+      # unverified binary straight to chmod +x and ran it with credentials that can patch
+      # the cluster. Verified locally that a corrupted download fails this check.
+      #
+      # Worth being precise about what this buys: the checksum comes from the same host as
+      # the binary, so it catches truncation and corruption in transit, not a compromised
+      # release host. That is still the documented way to install kubectl.
+      - curl -sSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+      - curl -sSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+      - echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+      - chmod +x ./kubectl
       - export PATH=$PWD/:$PATH
-      - python -m pip install --upgrade --force pip
-      - apt-get update && apt-get -y install jq  && pip install --upgrade awscli
+      - kubectl version --client
+      # aws-iam-authenticator is no longer downloaded. It was pinned to release 1.10.3 from
+      # 2018-07-26, fetched without any integrity check, and unnecessary: since AWS CLI
+      # 1.16.156, `aws eks update-kubeconfig` writes an exec stanza calling `aws eks
+      # get-token` rather than the external binary. NOT verified against real CodeBuild,
+      # because that needs an AWS account. If kubectl fails with an exec-plugin error,
+      # restoring the download is the fallback.
+      - apt-get update && apt-get -y install jq
   pre_build:
       commands:
         - TAG="$REPOSITORY_NAME.$REPOSITORY_BRANCH.$ENVIRONMENT_NAME.$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
         - sed -i 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:$TAG"'@' simple_jwt_api.yml
-        - $(aws ecr get-login --no-include-email)
+        # get-login-password, not `$(aws ecr get-login --no-include-email)`. get-login was
+        # deprecated in CLI v1 and removed outright in v2, and it worked by printing a
+        # complete `docker login` command including the password, which then appeared in
+        # the build log. This pipes the token to stdin instead, so it is never an argument.
+        - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REPOSITORY_URI"
         - export KUBECONFIG=$HOME/.kube/config
         - pip3 install -r requirements.txt
         - python -m pytest test_main.py
@@ -36,10 +70,19 @@ phases:
     commands:
       - docker push $REPOSITORY_URI:$TAG
       - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --role-arn $EKS_KUBECTL_ROLE_ARN
-      - kubectl apply -f simple_jwt_api.yml 
+      # Create or update the Secret the Deployment reads, BEFORE applying the manifest.
+      # This is the step that was missing entirely: the secret reached the build
+      # environment and stopped there, so every pod fell back to the key committed in
+      # main.py. --dry-run=client piped into apply is the idempotent form; `kubectl create
+      # secret` on its own fails once the Secret exists, which would break the second
+      # deploy. The values arrive via --from-literal from the masked parameter-store
+      # variables above and are not echoed.
+      - kubectl create secret generic simple-jwt-api --from-literal=jwt-secret="$JWT_SECRET" --from-literal=auth-users="$AUTH_USERS" --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f simple_jwt_api.yml
+      # Wait for the rollout instead of reporting success the moment apply returns. Without
+      # this the build went green while the new pods were still starting, so a failing
+      # image looked like a successful deploy and only showed up in the cluster later.
+      - kubectl rollout status deployment/simple-jwt-api --timeout=300s
       - printf '[{"name":"simple_jwt_api","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
 artifacts:
   files: build.json
-env:
-  parameter-store:         
-    JWT_SECRET: JWT_SECRET

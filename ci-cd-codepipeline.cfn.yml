@@ -103,69 +103,189 @@ Resources:
   EcrDockerRepository:
     Type: AWS::ECR::Repository
     DeletionPolicy: Retain
+    # Both policies, per cfn-lint W3011: DeletionPolicy alone still lets a stack UPDATE
+    # that replaces the resource delete the original.
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Scan each pushed image for known CVEs. The pipeline pushes on every commit to
+      # master and nothing looked at the result.
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      # Untagged layers accumulate forever otherwise, and ECR storage is billed.
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 14 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 14
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
 
   CodePipelineArtifactBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # This bucket holds the source artifact, which is the whole repository, and it had
+      # none of the three defaults you would want on a bucket holding source.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Pipeline artifacts are disposable once the build is done; without this the
+          # bucket grows by one copy of the repository per commit, forever.
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
 
   CustomResourceLambda:
     Type: AWS::Lambda::Function
     Properties:
       Code:
         ZipFile: |
+          # Rewritten for three separate defects, each of which alone stopped this stack.
+          #
+          # 1. Runtime was python2.7. cfn-lint reports E2533: deprecated 2021-07-15, with
+          #    CREATION disabled the same day and updates from 2022-05-30. So the stack
+          #    could not be created at all, and this was the first thing to fail.
+          #
+          # 2. `from botocore.vendored import requests` then `requests.put(...)`. The
+          #    import still succeeds on botocore 1.43.70, which is what makes this subtle:
+          #    only `exceptions` and `packages` survive there, and put, post and get are
+          #    all gone. Verified in a container. So the call that signals CloudFormation
+          #    raised AttributeError and the custom resource never responded, leaving the
+          #    stack waiting on it. urllib.request is in the standard library and needs no
+          #    vendored anything.
+          #
+          # 3. `response["Reason"] = e` assigned the exception OBJECT, and json.dumps ran
+          #    outside the try/except. Verified: TypeError: Object of type Exception is not
+          #    JSON serializable. The error path therefore crashed before it could report
+          #    the error, so a genuine IAM failure produced a hang rather than a FAILED
+          #    status. str(exc) below, and the send is wrapped.
           import json
+          import urllib.request
+
           import boto3
-          from botocore.vendored import requests
-          def handler(event, context):
-            response = {
-              'Status': 'SUCCESS',
-              "Reason": "See the details in CloudWatch Log Stream: " + context.log_stream_name,
-              'PhysicalResourceId': context.log_stream_name,
+
+
+          # Response timeout. urlopen with no timeout uses the global default socket
+          # timeout, which is None, so a stalled pre-signed endpoint blocks until the Lambda
+          # itself is killed at 300s. The function then dies without signalling and the stack
+          # waits on the custom resource for an hour. 30s leaves room to still report.
+          RESPONSE_TIMEOUT_SECONDS = 30
+
+
+          def send(event, context, status, message):
+            body = json.dumps({
+              'Status': status,
+              'Reason': message + ' See details in CloudWatch Log Stream: ' + context.log_stream_name,
+              # ECHO the id CloudFormation sent, and only fall back on Create where there is
+              # none. Returning a NEW PhysicalResourceId on Update means CloudFormation
+              # treats the resource as replaced and sends a Delete for the old one, so using
+              # context.log_stream_name unconditionally made every update look like a
+              # replacement, because that value differs on every invocation.
+              'PhysicalResourceId': event.get('PhysicalResourceId') or context.log_stream_name,
               'StackId': event['StackId'],
               'RequestId': event['RequestId'],
               'LogicalResourceId': event['LogicalResourceId'],
-              'Data': {"Message": "Resource creation successful!"},
-            }
+              'Data': {'Message': message},
+            }).encode('utf-8')
+            request = urllib.request.Request(
+              event['ResponseURL'], data=body, method='PUT',
+              headers={'content-type': '', 'content-length': str(len(body))})
+            urllib.request.urlopen(request, timeout=RESPONSE_TIMEOUT_SECONDS)
 
-            client = boto3.client('iam')
+
+          def handler(event, context):
             try:
+              # Only Create does work. Update and Delete still have to answer, or the
+              # stack hangs on them for an hour and then rolls back.
               if event['RequestType'] == 'Create':
+                client = boto3.client('iam')
                 kubectl_role_name = event['ResourceProperties']['KubectlRoleName']
                 build_role_arn = event['ResourceProperties']['CodeBuildServiceRoleArn']
 
-                assume = client.get_role(RoleName = kubectl_role_name)
+                assume = client.get_role(RoleName=kubectl_role_name)
                 assume_doc = assume['Role']['AssumeRolePolicyDocument']
-                roles = [ { 'Effect': 'Allow', 'Principal': { 'AWS': build_role_arn }, 'Action': 'sts:AssumeRole' } ]
+                statements = assume_doc.get('Statement') or []
+                if isinstance(statements, dict):
+                  statements = [statements]
 
-                for statement in assume_doc['Statement']:
-                  if 'AWS' in statement['Principal']:
-                    if statement['Principal']['AWS'].startswith('arn:aws:iam:'):
-                      roles.append(statement)
+                # ADD to the trust policy; never rebuild it. The previous version kept only
+                # statements whose Principal was a dict containing AWS with a value starting
+                # 'arn:aws:iam:', and DISCARDED everything else, so it silently deleted:
+                #   Principal: {Service: ...}     an EC2 or EKS service trust
+                #   Principal: {Federated: ...}   an OIDC provider, e.g. IRSA
+                #   arn:aws-us-gov: / arn:aws-cn:  every non-commercial partition
+                # Since it wrote the filtered list back, any of those trusts on the role
+                # would be gone after stack creation. Keeping the list and appending has no
+                # such failure mode, and skipping the append when the ARN is already there
+                # keeps it idempotent across repeated Creates.
+                already = False
+                for statement in statements:
+                  principal = statement.get('Principal')
+                  if not isinstance(principal, dict):
+                    continue
+                  aws = principal.get('AWS')
+                  if aws is None:
+                    continue
+                  if isinstance(aws, str):
+                    aws = [aws]
+                  if build_role_arn in [str(a) for a in aws]:
+                    already = True
+                    break
 
-                assume_doc['Statement'] = roles
-                update_response = client.update_assume_role_policy(RoleName = kubectl_role_name, PolicyDocument = json.dumps(assume_doc))
-            except Exception as e:
-              print(e)
-              response['Status'] = 'FAILED'
-              response["Reason"] = e
-              response['Data'] = {"Message": "Resource creation failed"}
+                if not already:
+                  statements.append({'Effect': 'Allow',
+                                     'Principal': {'AWS': build_role_arn},
+                                     'Action': 'sts:AssumeRole'})
+                  assume_doc['Statement'] = statements
+                  client.update_assume_role_policy(
+                    RoleName=kubectl_role_name,
+                    PolicyDocument=json.dumps(assume_doc))
 
-            response_body = json.dumps(response)
-            headers = {'content-type': '', "content-length": str(len(response_body)) }
-            put_response = requests.put(event['ResponseURL'], headers=headers, data=response_body)
-            return response
+              send(event, context, 'SUCCESS', 'Resource creation successful!')
+            except Exception as exc:  # noqa: BLE001 - must report, never propagate
+              print(exc)
+              try:
+                send(event, context, 'FAILED', str(exc))
+              except Exception as send_exc:  # noqa: BLE001
+                # Nothing else can be done; the stack will time out on the resource.
+                print('failed to signal CloudFormation: %s' % send_exc)
 
       Handler: index.handler
       Role: !GetAtt CustomResourceLambdaExecutionRole.Arn
-      Runtime: python2.7
+      Runtime: python3.12
       Timeout: 300
 
   CustomResourceLambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       ManagedPolicyArns:
+        # AWSLambdaENIManagementAccess was dropped. AWS deprecated it in favour of
+        # AWSLambdaVPCAccessExecutionRole, and this function has no VpcConfig at all, so
+        # the ENI permissions it granted were never used.
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
       Path: /
       AssumeRolePolicyDocument:
         Version: 2012-10-17
@@ -192,9 +312,6 @@ Resources:
       ServiceToken: !GetAtt CustomResourceLambda.Arn
       KubectlRoleName: !Ref KubectlRoleName
       CodeBuildServiceRoleArn: !GetAtt CodeBuildServiceRole.Arn
-    DependsOn:
-      - CustomResourceLambda
-      - CodeBuildServiceRole
 
   CodePipelineServiceRole:
     Type: AWS::IAM::Role
@@ -212,25 +329,42 @@ Resources:
           PolicyDocument:
             Version: 2012-10-17
             Statement:
-              - Resource: "*"
+              # Was a single statement with Resource: "*" covering all of these. Two
+              # problems with that: the seven codecommit actions are dead, since the source
+              # stage is GitHub, and iam:PassRole on "*" beside codebuild:StartBuild on "*"
+              # is a privilege-escalation primitive. It lets this role hand ANY role in the
+              # account to a service it can start, which is how a CI role becomes an admin
+              # role. Both are now scoped to resources in this stack.
+              - Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}
                 Effect: Allow
                 Action:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
-                  - codecommit:GetBranch
-                  - codecommit:GetCommit
-                  - codecommit:UploadArchive
-                  - codecommit:GetUploadArchiveStatus
-                  - codecommit:CancelUploadArchive
+              - Resource:
+                  - !GetAtt CodeBuildServiceRole.Arn
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${KubectlRoleName}
+                Effect: Allow
+                Action:
                   - iam:PassRole
+              # Split by resource level, because s3:GetBucketVersioning was granted on the
+              # OBJECT arn and therefore could never match. Checked against the AWS service
+              # authorization data: GetBucketVersioning, GetBucketAcl and GetBucketLocation
+              # accept only arn:aws:s3:::<bucket>, while the object actions accept only
+              # arn:aws:s3:::<bucket>/<key>. CodePipeline needs the bucket three because it
+              # verifies the artifact store is versioned before using it, so on the old
+              # policy that check had no permission behind it.
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
               - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
                 Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:GetObject
                   - s3:GetObjectVersion
-                  - s3:GetBucketVersioning
-    DependsOn: CodePipelineArtifactBucket
 
   CodeBuildServiceRole:
     Type: AWS::IAM::Role
@@ -252,35 +386,49 @@ Resources:
                 Effect: Allow
                 Action:
                   - sts:AssumeRole
-              - Resource: '*'
+              # eks:Describe* on '*' narrowed to the one action the build makes and the
+              # one cluster it targets. Checked against the AWS service authorization data
+              # rather than assumed: eks:DescribeCluster accepts a cluster ARN, so this is
+              # scopable. `aws eks update-kubeconfig` is the only caller.
+              - Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EksClusterName}
                 Effect: Allow
                 Action:
-                  - eks:Describe*
-              - Resource: '*'
+                  - eks:DescribeCluster
+              # Was Resource: '*', which is read access to EVERY SSM parameter in the
+              # account, including other applications' SecureString secrets. Scoped to the
+              # two this build actually reads. iam-role-policy.json carried the same
+              # wildcard and is fixed the same way.
+              - Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/JWT_SECRET
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/AUTH_USERS
                 Effect: Allow
                 Action:
                   - ssm:GetParameters
-              - Resource: '*'
+              # Scoped to this project's own log group. All three accept a log-group ARN.
+              # NOT verified against real CodeBuild, which needs an AWS account: if a build
+              # fails with an AccessDenied on logs, widening this back to '*' is the fix.
+              - Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}:*
                 Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+              # Stays on '*', and that is correct rather than lazy: checked against the
+              # AWS service authorization data, ecr:GetAuthorizationToken accepts NO
+              # resource type at all, so '*' is the only policy that can grant it. Same
+              # shape as the ec2 Describe actions removed below.
               - Resource: '*'
                 Effect: Allow
                 Action:
                   - ecr:GetAuthorizationToken
-              - Resource: '*'
-                Effect: Allow
-                Action:
-                  - ec2:CreateNetworkInterface
-                  - ec2:DescribeDhcpOptions
-                  - ec2:DescribeNetworkInterfaces
-                  - ec2:DeleteNetworkInterface
-                  - ec2:DescribeSubnets
-                  - ec2:DescribeSecurityGroups
-                  - ec2:DescribeVpcs
-                  - ec2:CreateNetworkInterfacePermission
+              # The eight ec2 network-interface actions were removed. They are the standard
+              # grant for a CodeBuild project attached to a VPC, and this project has no
+              # VpcConfig, so nothing ever used them. Scoping was not an option either: the
+              # Describe actions accept no resource type, so the choice was '*' or nothing.
+              # Same reasoning as dropping AWSLambdaENIManagementAccess above. If a VPC is
+              # added to the project later, restore this statement.
               - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
                 Effect: Allow
                 Action:
@@ -364,4 +512,3 @@ Resources:
               OutputArtifacts:
                 - Name: BuildOutput
               RunOrder: 1
-    DependsOn: CodeBuildProject

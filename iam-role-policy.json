@@ -1,8 +1,20 @@
 {
- "Version": "2012-10-17",
- "Statement":[{
-     "Effect": "Allow",
-     "Action": ["eks:Describe*", "ssm:GetParameters"],
-     "Resource":"*"
- }]
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeOnlyThisCluster",
+      "Effect": "Allow",
+      "Action": "eks:DescribeCluster",
+      "Resource": "arn:aws:eks:<REGION>:<ACCOUNT_ID>:cluster/<CLUSTER_NAME>"
+    },
+    {
+      "Sid": "ReadOnlyThisApplicationsParameters",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameters",
+      "Resource": [
+        "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/JWT_SECRET",
+        "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/AUTH_USERS"
+      ]
+    }
+  ]
 }

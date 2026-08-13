@@ -1,12 +1,13 @@
 {
- "Version": "2012-10-17",
- "Statement": [
-     {
-         "Effect": "Allow",
-         "Principal": {
-             "AWS": "arn:aws:iam::<ACCOUNT_ID>:root"
-         },
-         "Action": "sts:AssumeRole"
-     }
- ]
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowTheOperatorToAssumeThisRoleDuringSetup",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "<YOUR_PRINCIPAL_ARN>"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
 }

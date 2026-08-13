@@ -1,4 +1,24 @@
+# Direct dependencies, unchanged from the original pins.
 pyjwt==1.7.1
 flask==1.1.2
 gunicorn==20.0.4
 pytest==6.2.2
+
+# Transitive dependencies of flask 1.1.2, pinned to the versions current in June 2021.
+#
+# These are additions, not upgrades: the four pins above are untouched. Without them pip
+# resolves flask's own requirements (Werkzeug>=0.15, Jinja2>=2.10.1, itsdangerous>=0.24,
+# click>=5.1) to whatever is newest today, and the result does not import at all:
+#
+#   File "/usr/local/lib/python3.7/site-packages/flask/__init__.py", line 14
+#     from jinja2 import escape
+#   ImportError: cannot import name 'escape' from 'jinja2'
+#
+# jinja2 3.0 removed the `escape` re-export that flask 1.1.2 imports at module scope, and
+# Werkzeug 2.x moved several names flask 1.x expects. So `pip install -r requirements.txt`
+# produced a broken app, and because buildspec.yml runs pytest, CodeBuild failed here too.
+Jinja2==2.11.3
+Werkzeug==1.0.1
+itsdangerous==1.1.0
+MarkupSafe==1.1.1
+click==7.1.2

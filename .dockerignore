@@ -1,0 +1,62 @@
+# Without this file, `COPY . /app` copied the whole working directory into the image.
+#
+# That mattered because the README tells the reader to create `.env_file` holding
+# JWT_SECRET, and then to `docker build` in the same directory. .gitignore keeps that file
+# out of git; nothing kept it out of the image. Measured by building the image and looking
+# inside it: /app/.env_file was present, complete with its JWT_SECRET assignment, and
+# /app/.git carried 28 files of history. The value itself is not repeated here, because
+# writing it into a tracked file re-commits the thing the finding is about and leaves every
+# secret scanner flagging this path forever.
+#
+# buildspec.yml pushes that image to ECR, so the secret travelled to a registry and sat in
+# a layer readable by anyone who could pull it. Deleting the file in a later layer would
+# not have helped either, since earlier layers keep it.
+.env
+.env.*
+.env_file
+.flaskenv
+.envrc
+.direnv
+*.pem
+*.key
+credentials*
+secrets/
+.aws/
+parameters.json
+
+# Version control and CI metadata: not needed at runtime, and .git carries the full history.
+.git
+.gitignore
+.gitattributes
+.github/
+.circleci/
+
+# Infrastructure and docs: deployed by other means, or not deployed at all.
+README.md
+*.cfn.yml
+buildspec.yml
+simple_jwt_api.yml
+iam-role-policy.json
+trust.json
+parameters.example.json
+
+# Tests and their artifacts. The image serves the app; buildspec runs pytest before the
+# build, from the source checkout rather than from inside the image.
+test_main.py
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+
+# Build and editor noise.
+__pycache__/
+*.pyc
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+env/
+.idea/
+.DS_Store

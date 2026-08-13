@@ -1,12 +1,28 @@
+# The Deployment below had no `env:` block at all, which was the most serious defect in
+# this repository. main.py read JWT_SECRET from the environment and fell back to a literal
+# committed here, so every pod signed tokens with a key published on GitHub and anyone could
+# mint a token the API accepts for any email. buildspec.yml did fetch the real value from
+# Parameter Store, but into the CodeBuild environment, which the pods never see. The README
+# claimed the secret "will be set during build (by CodeBuild) as an environment variable",
+# true of the build container and false of the running service.
+#
+# The secret is now read from a Kubernetes Secret that buildspec.yml creates from the
+# Parameter Store values immediately before applying this file.
+---
 apiVersion: v1
 kind: Service
 metadata:
   name: simple-jwt-api
 spec:
+  # Plain HTTP on port 80. Every token this service issues and accepts therefore crosses
+  # the network in cleartext, which is worth naming rather than leaving implied: a bearer
+  # token is a password with an expiry date. Terminating TLS needs a certificate and a
+  # hostname, so it is left as an exercise in the README rather than half-configured here.
   type: LoadBalancer
   ports:
     - port: 80
       targetPort: 8080
+      protocol: TCP
   selector:
     app: simple-jwt-api
 ---
@@ -16,10 +32,16 @@ metadata:
   name: simple-jwt-api
 spec:
   replicas: 3
+  # Keep the last few ReplicaSets only. The default is 10, which clutters `kubectl get rs`
+  # in a cluster that redeploys on every push to master.
+  revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 2
+      # Was maxUnavailable: 2 of 3 replicas, so a rollout could take two thirds of capacity
+      # down at once, and with no readiness probe nothing gated whether the replacement
+      # could serve before the next pod was removed. One at a time, gated by the probe below.
+      maxUnavailable: 1
       maxSurge: 2
   selector:
     matchLabels:
@@ -29,12 +51,96 @@ spec:
       labels:
         app: simple-jwt-api
     spec:
+      securityContext:
+        # The image creates uid 10001 and runs as it. runAsNonRoot makes the kubelet refuse
+        # to start the pod if a future image regresses to root, rather than silently
+        # allowing it.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
       containers:
         - name: simple-jwt-api
+          # Replaced by buildspec.yml's sed with the tagged ECR image. Applying this file
+          # unsubstituted does NOT fail at apply time: measured on k3s v1.31.5, `kubectl
+          # apply` reports the Deployment created and the kubelet then rejects the pod with
+          #   InvalidImageName: couldn't parse image name "CONTAINER_IMAGE": invalid
+          #   reference format: repository name (library/CONTAINER_IMAGE) must be lowercase
+          # so the pods sit at 0/1 and never start. The pipeline owns this substitution.
           image: CONTAINER_IMAGE
           securityContext:
             privileged: false
-            readOnlyRootFilesystem: false
+            # Was false. The app writes nothing to disk; gunicorn's worker heartbeat lives
+            # under /tmp, which is mounted as an emptyDir below.
+            readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8080
+              protocol: TCP
+          # One limitation of reading the secret this way, measured on k3s v1.31.5 rather
+          # than assumed: env.valueFrom injects the value when the container STARTS, so
+          # updating the Secret does not reach running pods. After rotating it, the Secret
+          # read `rotated-under-rbac` while the pod still reported the previous value, and
+          # only a change to the pod template brought the new one in.
+          #
+          # The pipeline is fine, because buildspec.yml builds a new image tag on every
+          # commit and that changes the template, which restarts the pods. Rotating the
+          # Parameter Store value WITHOUT a new build does not propagate: run
+          # `kubectl rollout restart deployment/simple-jwt-api` after such a rotation.
+          # Mounting the Secret as a volume would update in place, but the app reads its
+          # configuration from the environment, so that would be a larger change.
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: simple-jwt-api
+                  key: jwt-secret
+            - name: AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: simple-jwt-api
+                  key: auth-users
+            - name: LOG_LEVEL
+              value: INFO
+          # Neither probe existed. Without a readiness probe the Service sent traffic to
+          # pods that had not finished starting, and without a liveness probe a wedged
+          # gunicorn master stayed in the endpoint list indefinitely. / is the health route
+          # and needs no credentials.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # No requests meant the scheduler treated these as zero-cost and they landed in
+          # the BestEffort QoS class, first to be evicted under memory pressure. The
+          # figures are deliberately small; this is a single gunicorn worker serving three
+          # trivial routes, and PBKDF2 at 260,000 iterations is the only real CPU cost.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Required by readOnlyRootFilesystem: gunicorn writes its worker temporary files
+        # here. emptyDir rather than a real volume, because nothing needs to outlive the pod.
+        - name: tmp
+          emptyDir: {}

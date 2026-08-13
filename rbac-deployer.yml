@@ -1,0 +1,64 @@
+# Least-privilege RBAC for the CodeBuild role, replacing a system:masters mapping.
+#
+# The README used to map the build role into the system:masters group, which is unrestricted
+# cluster administration: read every Secret in every namespace, delete anything, exec into
+# any pod. That is the standard tutorial shortcut, and it means a compromise of the CI
+# pipeline, or of any dependency it installs, is a compromise of the whole cluster.
+#
+# The build only needs to do four things in one namespace: upsert a Secret, apply a Service
+# and a Deployment, and watch the rollout. That is what this grants.
+#
+# A Role and RoleBinding, not the ClusterRole pair, so the grant cannot reach another
+# namespace. Apply it once, as the cluster creator, before the first pipeline run.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: simple-jwt-api-deployer
+  namespace: default
+rules:
+  # kubectl apply needs to read the current object before it can compute a patch, and to
+  # create it when absent. No delete: the pipeline never removes anything, and leaving it
+  # out means a compromised build cannot destroy the Service to cause an outage.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # The Secret holding JWT_SECRET and AUTH_USERS. Scoped by name with resourceNames, so this
+  # cannot read any OTHER Secret in the namespace, which is the permission that made
+  # system:masters dangerous. Note that `create` cannot be restricted by resourceNames: the
+  # name is in the request body, not the URL, so it is granted separately below.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["simple-jwt-api"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  # `kubectl rollout status` watches the Deployment and reads the ReplicaSets and Pods
+  # behind it. Read-only.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: simple-jwt-api-deployer
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: simple-jwt-api-deployer
+subjects:
+  # Bound to a GROUP, and the aws-auth ConfigMap maps the IAM role into that group. Binding
+  # the username instead would work, but the group keeps the mapping and the permissions
+  # independent: a second build role joins by editing aws-auth alone.
+  - kind: Group
+    name: simple-jwt-api-deployers
+    apiGroup: rbac.authorization.k8s.io
